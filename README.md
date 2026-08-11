@@ -1,22 +1,10 @@
 # Casita
 
-[![Documentation](https://img.shields.io/badge/docs-casita-0b6e4f?style=for-the-badge)](https://matin.github.io/casita/)
-
-Casita is a personal rental-search tool published as a public repo.
-
-It started as a small script for a time-boxed San Francisco rental search with
-two large dogs: scrape Zillow, Craigslist, Zumper, and Redfin; enrich the
-listings; rank them; and render a static page that was easier to review than
-four open browser tabs.
-
-This is not a product or service. It is published as-is, under MIT, as a
-personal-use codebase for an interview loop. The interesting part is what a
-candidate chooses to improve.
+A personal rental search tool for a household with two large dogs, published as-is for an interview loop.
 
 ## Demo
 
-The demo is credentials-free and uses a sanitized SQLite fixture with cached
-route times and precomputed LLM enrichment.
+The base demo needs no credentials. It runs off a sanitized SQLite fixture with cached route times and precomputed rankings already baked in.
 
 ```bash
 uv sync
@@ -24,84 +12,109 @@ uv run playwright install chromium
 uv run casita demo
 ```
 
-Then open <http://127.0.0.1:8765/>.
+Open <http://127.0.0.1:8765/>.
 
-The demo does not scrape, call Vertex, deploy to Firebase, read GCS, or call the
-Google Maps Routes API. It does use Playwright's local Chromium browser to
-render Open Graph preview images from listing photos and facts. Live `search` /
-`enrich` / `publish` paths still exist for private use and are controlled by
-environment variables; see `.env.example`.
-
-## What It Does
-
-- Scrapes active rental listings from Zillow, Craigslist, Zumper, and Redfin.
-- Normalizes listing facts into SQLite.
-- Classifies dog policy and enriches details from listing pages.
-- Uses Gemini for fact extraction, photo review, share blurbs, and ranking.
-- Computes walking and driving times to curated SF / Marin anchors.
-- Renders a static, mobile-friendly site with index and detail pages.
-- Records votes and passes so future ranking can learn from reviewer feedback.
-
-The domain assumptions are intentionally personal: large dogs, San Francisco
-walkability, Marin driving context, trails, beaches, and good bakeries nearby.
-That is the point of a personal tool.
-
-## What I Added: A Conversational Preference Agent
-
-The domain assumptions above are fixed — hardcoded into `rank.py`'s scoring
-constants and the ranking prompt in `llm.py`. The one existing way to shift
-them is voting listing-by-listing and waiting for `casita analyze-prefs` to
-notice a pattern worth hand-editing into policy. There was no way to just
-say what you want.
-
-I added a second, separate mechanism: a conversational agent, reachable by
-voice (`casita demo --voice`) or text (`casita demo --intake`), that talks
-to you for a minute and re-ranks the demo listings around what you said —
-both your logistics ("no small dogs, need in-unit laundry") and, further,
-your emotional context ("I want somewhere that feels like a calm retreat,
-lots of natural light"). It's scoped as session personalization, not policy
-authorship: it never touches the durable `_RANK_SYSTEM` policy or the vote
-loop, and the logistics gate stays absolute no matter how well a listing
-matches the emotional read. See
-[`docs/how-it-works/preferences.md`](docs/how-it-works/preferences.md) for
-the full mechanism, and the before/after of what it does and doesn't change.
-
-**Where it came from.** I'd built a close cousin of this at Co
-(CoPatible) — a voice-and-text concierge that extracts a structured profile
-(`life_chapters`, `emotional_state`, `goals`, `blockers`) from free
-conversation rather than a form, using one shared persona across a live
-voice call (Hume EVI) and iMessage (Sendblue), spoken replies via ElevenLabs
-TTS, and a persistent Postgres profile. "Give someone their dream house
-based on their emotional context" is the housing version of that same
-instinct. What's different here is scale and stakes: Co is a multi-channel,
-multi-user, persistent-state production system. This is sized for what an
-interview take-home should actually ship — ephemeral, single-session, no new
-infrastructure beyond what the repo already has, plus one credential for
-real voice. No iMessage bot, no persistent profile store, no durable policy
-writes; those were explicit cuts, not oversights.
-
-## Docs
-
-The [documentation site](https://matin.github.io/casita/) explains the systems
-without turning them into assigned tasks. To run it locally instead:
+To try the conversational agent:
 
 ```bash
-uv run zensical serve
+uv run casita demo --intake   # type what you want, no credentials needed
+uv run casita demo --voice    # say what you want, needs Gemini credentials and a mic
 ```
 
-Start at `docs/index.md`, or run `uv run zensical build` to generate the site.
+`/chat/` is also live on the running demo site. No flag needed, just click "chat" on the page.
 
-## Checks
+## What it does
+
+- Scrapes active listings from Zillow, Craigslist, Zumper, and Redfin.
+- Normalizes everything into one SQLite schema.
+- Uses Gemini to extract facts, review photos, write share blurbs, and rank listings.
+- Computes walking and driving times to curated SF and Marin anchors: trails, beaches, bakeries.
+- Renders a static site with an index page and a detail page per listing.
+- Tracks up and down votes so a human can review revealed preference and hand-edit the ranking policy.
+- Talks or types with you about what you want (voice, typed terminal, or live browser chat) and reorders the listings around it for that session.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Input["Three ways in"]
+        V["--voice<br/>push-to-talk"]
+        T["--intake<br/>typed, terminal"]
+        C["/chat/<br/>typed, browser, live"]
+    end
+
+    subgraph Pipeline["One shared pipeline"]
+        E["Extract<br/>logistics + emotional profile"]
+        R["Re-rank<br/>rank.py gate unchanged,<br/>plus a session bonus"]
+        X["Explain<br/>routing + conflict narration"]
+    end
+
+    subgraph Output["Where it shows up"]
+        TERM["Terminal table,<br/>plus a spoken reply for --voice"]
+        SITE["Rendered site,<br/>top matches + active leads"]
+        LIVE["/chat/ page,<br/>updates in place"]
+    end
+
+    V --> E
+    T --> E
+    C --> E
+    E --> R --> X
+    X --> TERM
+    X --> SITE
+    X --> LIVE
+```
+
+Three input modes feed the same extraction, re-rank, and explain pipeline. What you get back depends on how you talked to it: a printed table and a spoken reply for `--voice`, a re-rendered page for `--voice`/`--intake`, or a live-updating page for `/chat/`.
+
+## Voice mode
+
+`casita demo --voice` is a real voice conversation, not text input with a voice wrapper on top. Here's what happens on each turn:
+
+1. Press Enter, say what you want, press Enter again to stop. This is push-to-talk, not always-on listening. It keeps the turn boundary explicit and needs no voice activity detection.
+2. The recorded audio, plus a text summary of everything said in earlier turns, goes to Gemini in one multimodal call. Gemini transcribes the audio and extracts a structured preference profile (dog policy, laundry, parking, minimum beds, and how the person wants the place to feel) in that same call. There's no separate speech-to-text step.
+3. The listings get re-ranked using that profile, layered on top of the existing scoring (see "How it works" below).
+4. Gemini writes a short spoken reply grounded in the ranked results, then speaks it back using its own native audio output. No separate text-to-speech vendor.
+5. The conversation keeps going until one of four things happens: a turn comes back silent, you say something like "that's all" or "stop", the model decides it already has enough to work with, or fifteen minutes pass.
+
+The first turn asks a specific opening question (beds, parking, laundry, trail or beach access, how you want it to feel) instead of an open "tell me about yourself," since the extraction schema is fixed and the question should point straight at it.
+
+## How it works
+
+Ranking already had two layers before this feature: a scoring function with fixed constants (`rank.py`), and an LLM ranking pass using a big prompt written around one household's preferences (`llm.py`). Neither of those changed.
+
+The conversational agent adds a third layer that only runs for the current session: extract what was said, add it as a bonus on top of the existing score, and never let it override the hard gate. A listing with no dogs allowed is still a hard no, no matter how well it otherwise matches what someone said about wanting good light.
+
+The agent also respects the same priority the rest of the site already uses. A listing already declined by a landlord, or one actively being pursued in the CRM pipeline, keeps that status no matter what gets said in one conversation. A stated preference can move things around inside a tier. It can't rescue a dead lead or bury an active one.
+
+More detail lives in [`docs/how-it-works/preferences.md`](docs/how-it-works/preferences.md) and the full build history in [`docs/build-log.md`](docs/build-log.md).
+
+## Tech stack
+
+- Python and Click for the CLI
+- SQLite for storage, no external database
+- Pydantic for structured LLM outputs: preference profiles, extracted facts, rankings
+- Gemini via Vertex AI for extraction, ranking, photo review, and voice
+- `sounddevice` for local mic capture and playback in `--voice`
+- Playwright for scraping and rendering Open Graph preview images
+- Static HTML, CSS, and JS for the site, no frontend framework
+- Google Maps Routes API for live route times, with a cached offline fallback
+
+## Environment setup
+
+The base demo needs nothing. `uv run casita demo` runs off a committed fixture and never calls a live API.
+
+For live search, ranking, or the conversational agent with real Gemini:
 
 ```bash
-make check
+cp .env.example .env
 ```
 
-This compiles the Python modules, runs the pytest suite, runs the public leak
-validator, builds the docs, builds the Python package artifacts, and checks
-that the CLI imports.
+Then fill in what you need:
 
-## Contributing
+- `CASITA_GCP_PROJECT`: a GCP project with Vertex AI enabled
+- `CASITA_VOICE_MODEL`: model used for `--voice`'s transcription and replies, defaults to a fast one
+- `GOOGLE_MAPS_API_KEY`: optional, only needed for live route calculations
 
-Read `CONTRIBUTING.md`. The short version: fork the repo, pick something you
-think makes Casita better, and explain why you chose it.
+The rest of the variables are documented inline in `.env.example`.
+
+You'll also need to run `gcloud auth application-default login` once, so the Gemini client has something to authenticate with.
