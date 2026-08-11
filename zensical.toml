@@ -10,6 +10,7 @@ copyright = "Copyright &copy; 2026 Casita contributors"
 nav = [
   { "Backstory" = "index.md" },
   { "Getting Started" = "getting-started.md" },
+  { "Build Log" = "build-log.md" },
   { "How It Works" = [
     { "Routing" = "how-it-works/routing.md" },
     { "Photo Evaluation" = "how-it-works/photo-eval.md" },

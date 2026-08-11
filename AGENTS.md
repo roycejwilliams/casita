@@ -49,12 +49,14 @@ docs page before changing code.
 | --- | --- |
 | Backstory, contributor invitation, and product assumptions | [`docs/index.md`](docs/index.md) |
 | First-run demo and live-run setup | [`docs/getting-started.md`](docs/getting-started.md) |
+| Step-by-step build decisions and what was cut, for the added feature | [`docs/build-log.md`](docs/build-log.md) |
 | Module map and rough edges | [`docs/architecture.md`](docs/architecture.md) |
 | SQLite schema and fixture contract | [`docs/data-model.md`](docs/data-model.md) |
 | Source scraping behavior | [`docs/scraping.md`](docs/scraping.md) |
 | Route matrix cache, Maps costs, offline fallback | [`docs/how-it-works/routing.md`](docs/how-it-works/routing.md) |
 | Gemini photo review | [`docs/how-it-works/photo-eval.md`](docs/how-it-works/photo-eval.md) |
 | Deterministic and LLM ranking | [`docs/how-it-works/ranking.md`](docs/how-it-works/ranking.md) |
+| Stated (not just voted) preference intake | [`docs/how-it-works/preferences.md`](docs/how-it-works/preferences.md) |
 | Vote feedback loop | [`docs/how-it-works/learning.md`](docs/how-it-works/learning.md) |
 | Static rendering | [`docs/how-it-works/static-site.md`](docs/how-it-works/static-site.md) |
 

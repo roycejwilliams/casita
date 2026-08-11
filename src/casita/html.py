@@ -549,6 +549,20 @@ h1 {
 .lede em { font-style: italic; color: var(--ink); }
 @media (max-width: 600px) { .lede { font-size: 16.5px; margin-top: 12px; } }
 
+/* session preference banner — only rendered after --intake/--voice filters
+   the grid around what was said; never present on the base demo. */
+.session-banner {
+  margin-top: 18px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+}
+.session-banner strong { color: var(--accent); }
+
 /* editorial stat strip */
 .stats {
   display: flex; flex-wrap: wrap; align-items: baseline;
@@ -748,6 +762,7 @@ h1 {
   display: inline-flex; align-items: center; gap: 7px;
   box-shadow: 0 1px 2px var(--shadow);
   transition: color 0.18s ease, border-color 0.18s ease;
+  text-decoration: none;
 }
 .export-btn:hover { color: var(--accent); border-color: var(--accent); }
 .export-btn[data-state="copied"] { color: var(--accent); border-color: var(--accent); }
@@ -1627,10 +1642,14 @@ def render(
     drive_bakery_map: dict | None = None,
     drive_map: dict | None = None,
     title: str = "Casita",
+    session_banner: str = "",
 ) -> str:
     convo_map = convo_map or {}
     drive_bakery_map = drive_bakery_map or {}
     drive_map = drive_map or {}
+    session_banner_html = (
+        f'<div class="session-banner">{session_banner}</div>' if session_banner else ""
+    )
 
     # Pick the feature card — the top-ranked strong fit that isn't eliminated.
     # rank() already sorts best-first, so the first qualifying listing wins.
@@ -1701,7 +1720,7 @@ def render(
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..500&display=swap">
-<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Symbols+Outlined&icon_names=arrow_upward,arrow_downward,arrow_outward,arrow_back,ios_share,cancel,auto_awesome&display=block">
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Symbols+Outlined&icon_names=arrow_upward,arrow_downward,arrow_outward,arrow_back,ios_share,cancel,auto_awesome,forum&display=block">
 <meta property="og:type" content="website">
 <meta property="og:title" content="{title} — rental search demo">
 <meta property="og:description" content="{sub}">
@@ -1725,12 +1744,14 @@ def render(
       <span class="tagline">rental search demo</span>
     </div>
     <div class="header-actions">
+      <a href="/chat/" class="export-btn" title="talk to the preference agent — re-rank this session's listings around what you say"><span class="material-symbols-outlined">forum</span><span class="export-btn-label">chat</span></a>
       <button id="export-votes" class="export-btn" type="button" title="share all up/pass votes as a link — paste to Claude to incorporate"><span class="material-symbols-outlined">ios_share</span><span class="export-btn-label">export votes</span></button>
       {THEME_SWITCH_HTML}
     </div>
   </div>
   <p class="lede">A rental-search snapshot for a household with two large dogs: SF walkability, Marin drive times, trail access, and good bread nearby.</p>
   {stats_html}
+  {session_banner_html}
   <div class="toolbar">
     <div class="search-box">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -1756,6 +1777,265 @@ def render(
 {SEARCH_JS}
 {SHARE_JS}
 {VOTE_JS}
+{THEME_SWITCH_JS}
+</body>
+</html>
+"""
+
+
+# —— /chat/ — the third preference-agent mode: a live, in-browser TEXT
+# chat, no audio (see docs/how-it-works/preferences.md and
+# src/casita/chat_api.py). Reuses the shared head/theme plumbing and the
+# .badge/.dog-badge class names from the card CSS above so a listing
+# summary here still looks like it belongs to Casita; everything else is a
+# small CSS block scoped to this page plus a vanilla-JS fetch() loop
+# talking to POST /api/chat and /api/chat/reset. No frameworks, no build
+# step, no mic — text only, by design, this pass.
+CHAT_CSS = """
+.chat-wrap { display: grid; gap: 22px; grid-template-columns: 1fr; margin-top: 8px; }
+@media (min-width: 900px) { .chat-wrap { grid-template-columns: 1.1fr 0.9fr; align-items: start; } }
+
+.chat-panel {
+  background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+  box-shadow: 0 1px 2px var(--shadow);
+  display: flex; flex-direction: column;
+  height: min(62vh, 620px); min-height: 360px;
+}
+.chat-log { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.chat-msg { max-width: 82%; padding: 10px 14px; border-radius: 14px; font-size: 14.5px; line-height: 1.45; white-space: pre-wrap; }
+.chat-msg-user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.chat-msg-agent { align-self: flex-start; background: var(--card-2); color: var(--ink); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+.chat-msg-error { align-self: stretch; background: var(--warn-soft); color: var(--warn); border: 1px solid var(--warn); font-weight: 500; }
+.chat-msg-system { align-self: center; color: var(--ink-3); font-size: 12px; font-style: italic; background: none; }
+.chat-form { display: flex; gap: 10px; padding: 14px; border-top: 1px solid var(--line); }
+.chat-input {
+  flex: 1; border: 1px solid var(--line); border-radius: 999px; padding: 10px 16px;
+  font-family: inherit; font-size: 14.5px; background: var(--paper); color: var(--ink); outline: 0;
+}
+.chat-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.chat-send {
+  border: 0; border-radius: 999px; padding: 10px 20px; background: var(--accent); color: #fff;
+  font-family: inherit; font-size: 14.5px; font-weight: 600; cursor: pointer;
+}
+.chat-send:disabled { opacity: 0.5; cursor: default; }
+
+.chat-side { display: flex; flex-direction: column; gap: 22px; }
+.chat-card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+  box-shadow: 0 1px 2px var(--shadow); padding: 18px 20px;
+}
+.chat-card h2 {
+  margin: 0 0 12px; font-family: var(--serif); font-optical-sizing: auto; font-weight: 460;
+  font-size: 17px; color: var(--ink);
+}
+.chat-empty { color: var(--ink-3); font-size: 13px; }
+.profile-grid { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; font-size: 13.5px; }
+.profile-grid dt { color: var(--ink-3); font-weight: 600; white-space: nowrap; }
+.profile-grid dd { margin: 0; color: var(--ink); }
+
+.chat-listings { display: flex; flex-direction: column; gap: 12px; max-height: 520px; overflow-y: auto; }
+.chat-listing { position: relative; display: flex; gap: 12px; border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: var(--card-2); }
+.chat-listing-img { width: 68px; height: 68px; border-radius: 8px; object-fit: cover; background: var(--img-bg); flex-shrink: 0; }
+.chat-listing-noimg { width: 68px; height: 68px; border-radius: 8px; background: var(--img-bg); flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: var(--ink-3); font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em; text-align: center; }
+.chat-listing-body { flex: 1; min-width: 0; }
+.chat-listing-title { font-weight: 600; font-size: 13.5px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-listing-meta { font-size: 12px; color: var(--ink-2); margin-top: 2px; }
+.chat-listing-score { font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+.chat-listing-explanation { font-size: 12px; color: var(--ink-2); margin-top: 4px; font-style: italic; }
+.chat-listing .dog-badge { position: static; display: inline-block; margin-top: 4px; font-size: 9px; padding: 3px 8px; }
+
+.chat-backlink {
+  display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); text-decoration: none;
+  font-size: 13px; font-weight: 600; margin-bottom: 6px;
+}
+.chat-backlink:hover { color: var(--accent); }
+"""
+
+
+CHAT_JS = """<script>
+(function() {
+  var DOG_LABELS = {large_ok: 'Large dogs OK', dogs_ok: 'Dogs OK', small_only: 'Small dogs only', no_dogs: 'No dogs'};
+  var PROFILE_LABELS = {
+    wants_trail_or_beach_access: 'Wants trail/beach access',
+    needs_in_unit_laundry: 'Needs in-unit laundry',
+    needs_parking: 'Needs parking',
+    min_beds: 'Min beds',
+    notes: 'Logistics notes',
+    light_preference: 'Light preference',
+    view_preference: 'View preference',
+    condition_preference: 'Condition preference',
+    wants_outdoor_space: 'Wants outdoor space',
+    desired_feeling: 'Desired feeling',
+  };
+
+  var log = document.getElementById('chat-log');
+  var form = document.getElementById('chat-form');
+  var input = document.getElementById('chat-input');
+  var sendBtn = document.getElementById('chat-send');
+  var profilePanel = document.getElementById('profile-panel');
+  var listingsPanel = document.getElementById('listings-panel');
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s == null ? '' : String(s);
+    return d.innerHTML;
+  }
+
+  function addMessage(text, cls) {
+    var div = document.createElement('div');
+    div.className = 'chat-msg chat-msg-' + cls;
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function fmtValue(key, value) {
+    if (value === true) return 'yes';
+    if (value === false) return 'no';
+    if (value === null || value === undefined || value === '') return '—';
+    if (value === 'no_preference') return 'no preference';
+    return String(value).replace(/_/g, ' ');
+  }
+
+  function renderProfile(profile) {
+    if (!profile) return;
+    var rows = [];
+    var sections = [profile.logistics || {}, profile.emotional || {}];
+    sections.forEach(function(section) {
+      Object.keys(section).forEach(function(key) {
+        var label = PROFILE_LABELS[key] || key;
+        rows.push('<dt>' + esc(label) + '</dt><dd>' + esc(fmtValue(key, section[key])) + '</dd>');
+      });
+    });
+    profilePanel.innerHTML = '<dl class="profile-grid">' + rows.join('') + '</dl>';
+  }
+
+  function renderRanked(ranked) {
+    if (!ranked || !ranked.length) {
+      listingsPanel.innerHTML = '<p class="chat-empty">No ranked listings yet.</p>';
+      return;
+    }
+    listingsPanel.innerHTML = ranked.map(function(item) {
+      var img = item.image_url
+        ? '<img class="chat-listing-img" src="' + esc(item.image_url) + '" alt="" loading="lazy">'
+        : '<div class="chat-listing-noimg">no photo</div>';
+      var dogBadge = item.dog_policy
+        ? '<span class="dog-badge dog-badge-' + esc(item.dog_policy) + '">' + esc(DOG_LABELS[item.dog_policy] || item.dog_policy) + '</span>'
+        : '';
+      var priceText = item.price ? ('$' + item.price.toLocaleString() + '/mo') : 'price on request';
+      var metaBits = [priceText];
+      if (item.hood) metaBits.push(item.hood);
+      var explanation = item.explanation ? '<div class="chat-listing-explanation">' + esc(item.explanation) + '</div>' : '';
+      return (
+        '<div class="chat-listing">' + img +
+        '<div class="chat-listing-body">' +
+        '<div class="chat-listing-title">' + esc(item.title) + '</div>' +
+        '<div class="chat-listing-meta">' + esc(metaBits.join(' · ')) + '</div>' +
+        '<div class="chat-listing-score">score ' + esc(item.total) + ' (base ' + esc(item.base) + ' + bonus ' + esc(item.bonus) + ')</div>' +
+        dogBadge + explanation +
+        '</div></div>'
+      );
+    }).join('');
+  }
+
+  function send() {
+    var text = (input.value || '').trim();
+    if (!text) return;
+    addMessage(text, 'user');
+    input.value = '';
+    input.disabled = true;
+    sendBtn.disabled = true;
+    fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text}),
+    }).then(function(r) { return r.json(); }).then(function(data) {
+      if (data.error) {
+        addMessage(data.error, 'error');
+        return;
+      }
+      addMessage(data.reply, 'agent');
+      renderProfile(data.profile);
+      renderRanked(data.ranked);
+    }).catch(function() {
+      addMessage("couldn't reach the server — try again.", 'error');
+    }).finally(function() {
+      input.disabled = false;
+      sendBtn.disabled = false;
+      input.focus();
+    });
+  }
+
+  form.addEventListener('submit', function(e) { e.preventDefault(); send(); });
+
+  fetch('/api/chat/reset', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})
+    .catch(function() {});
+})();
+</script>"""
+
+
+def render_chat(title: str = "Casita") -> str:
+    """The `/chat/` page: a live, in-browser TEXT preference chat — the
+    third mode alongside `casita demo --intake`/`--voice`, browser-only and
+    always rendered (no CLI flag; it fails gracefully without Gemini
+    credentials, same as `--intake`). See `chat_api.py` for the JSON shape
+    this page's JS consumes.
+    """
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f1eee5">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#15130d">
+<meta name="color-scheme" content="light dark">
+<meta name="format-detection" content="telephone=no">
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..500&display=swap">
+<title>Chat — {title}</title>
+<style>{CSS}{CHAT_CSS}</style>
+{THEME_PREPAINT}
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="brandline">
+    <div class="wordmark">
+      <a class="chat-backlink" href="/">&larr; {title}</a>
+    </div>
+    <div class="header-actions">
+      {THEME_SWITCH_HTML}
+    </div>
+  </div>
+  <h1>Talk to the agent</h1>
+  <p class="lede">Tell it what you're looking for — beds, parking, laundry, trail or beach access, and how you want the place to feel. It re-ranks this session's listings around what you say. Nothing here is saved beyond this browser session.</p>
+</header>
+<main class="chat-wrap">
+  <div class="chat-panel">
+    <div id="chat-log" class="chat-log">
+      <div class="chat-msg chat-msg-system">Say a bit about what you're looking for to get started.</div>
+    </div>
+    <form id="chat-form" class="chat-form">
+      <input id="chat-input" class="chat-input" type="text" autocomplete="off" placeholder="e.g. we need in-unit laundry and a sunny place near a trail">
+      <button id="chat-send" class="chat-send" type="submit">Send</button>
+    </form>
+  </div>
+  <div class="chat-side">
+    <div class="chat-card">
+      <h2>Your profile so far</h2>
+      <div id="profile-panel"><p class="chat-empty">Nothing yet — say something to get started.</p></div>
+    </div>
+    <div class="chat-card">
+      <h2>Ranked listings</h2>
+      <div id="listings-panel"><p class="chat-empty">No ranked listings yet.</p></div>
+    </div>
+  </div>
+</main>
+</div>
+{CHAT_JS}
 {THEME_SWITCH_JS}
 </body>
 </html>

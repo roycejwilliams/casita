@@ -28,6 +28,10 @@ SOURCE_PRIORITY = {
 
 EARTH_M_PER_DEG_LAT = 111_320.0
 
+# Fields where a cross-source disagreement is worth surfacing to the user,
+# rather than just picking whichever source happened to be primary.
+CONFLICT_FIELDS = ["price", "dog_policy", "parking", "laundry"]
+
 
 def _meters_between(a_lat, a_lng, b_lat, b_lng) -> float:
     """Equirectangular approximation — fine at the ~100m scale we care about."""
@@ -107,6 +111,21 @@ def _merge(primary: Listing, secondary: Listing) -> Listing:
         v_sec = getattr(secondary, field)
         if v_pri in (None, "", "?"):
             setattr(out, field, v_sec)
+    # Record disagreements on fields worth surfacing, even though we don't
+    # overwrite primary's value with secondary's. `primary` (not `out`) is
+    # the pre-fill value — the fields above may already have overwritten
+    # `out`, but a real conflict only exists when BOTH sides had a value.
+    conflicts = out.raw.setdefault("source_conflicts", [])
+    for field in CONFLICT_FIELDS:
+        v_pri = getattr(primary, field)
+        v_sec = getattr(secondary, field)
+        if v_pri in (None, "", "?") or v_sec in (None, "", "?"):
+            continue
+        if v_pri == v_sec:
+            continue
+        conflict = {"field": field, primary.source: v_pri, secondary.source: v_sec}
+        if conflict not in conflicts:
+            conflicts.append(conflict)
     # Stash the alternate URL so the page can show "also on $source".
     others = out.raw.setdefault("also_on", [])
     others.append({"source": secondary.source, "url": secondary.url})

@@ -8,11 +8,13 @@ output schemas via `response_schema`.
 Swap to a different backend later by replacing _call_structured with another
 implementation; the schemas stay.
 """
+import io
 import json
 import os
 import re
 import sqlite3
 import textwrap
+import wave
 from typing import Literal
 
 from bs4 import BeautifulSoup
@@ -37,6 +39,16 @@ def _model_name(env_var: str, default: str) -> str:
 
 EXTRACT_MODEL = _model_name("CASITA_EXTRACT_MODEL", "gemini-3.1-pro-preview")
 RANK_MODEL = _model_name("CASITA_RANK_MODEL", "gemini-3.1-pro-preview")
+# `--voice`'s per-turn transcribe/extract + spoken-reply calls are latency-
+# sensitive in a way `rank_listings()`/`review_photos()` aren't — someone is
+# sitting there waiting to hear a reply. Kept on its own knob rather than
+# reusing RANK_MODEL, so tuning voice speed can never affect the durable
+# ranking/photo-review quality those other calls care more about.
+VOICE_MODEL = _model_name("CASITA_VOICE_MODEL", "gemini-2.5-flash")
+# Dedicated Gemini TTS model — native audio output, same Vertex client/creds
+# as everything else in this file. See `synthesize_speech`.
+TTS_MODEL = _model_name("CASITA_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+TTS_VOICE = os.environ.get("CASITA_TTS_VOICE", "Kore")
 
 _client: genai.Client | None = None
 
@@ -193,6 +205,88 @@ class PhotoReview(BaseModel):
             "exterior, outdoor space, common amenities) MUST NOT be in this "
             "list. If all photos look legitimate, return an empty list."
         ),
+    )
+
+
+class LogisticsProfile(BaseModel):
+    """The same shape `rank.py`'s `score()` already scores — extracted from
+    what someone actually said, not inferred beyond it.
+    """
+    wants_trail_or_beach_access: bool = Field(
+        description="True only if they said they want to be near a trail, "
+        "beach, hiking, or the outdoors generally."
+    )
+    needs_in_unit_laundry: bool = Field(
+        description="True only if they mentioned laundry or a washer/dryer."
+    )
+    needs_parking: bool = Field(
+        description="True only if they mentioned parking, a car, or a garage."
+    )
+    min_beds: int | None = Field(
+        None, description="Minimum bedroom count they stated. Null if unstated."
+    )
+    notes: str = Field(
+        description="Free-text catch-all for anything else stated that "
+        "doesn't fit the other fields. Empty string if nothing."
+    )
+
+
+class EmotionalProfile(BaseModel):
+    """How someone wants to *feel* in the place — layered on top of the
+    logistics gate as a bonus, never a substitute for it. Lines up with what
+    `PhotoReview` already captures on `Listing`: `light_quality`,
+    `view_quality`, `condition_quality`, `outdoor_visible`.
+    """
+    light_preference: Literal["abundant", "moderate", "no_preference"] = Field(
+        description="'abundant' = they said they crave natural light / sun; "
+        "'moderate' = light matters some but isn't a strong ask; "
+        "'no_preference' = not mentioned."
+    )
+    view_preference: Literal["panoramic", "open", "no_preference"] = Field(
+        description="'panoramic' = they want a big view (ocean/skyline/bridge); "
+        "'open' = generally outward-facing / not blocked is enough; "
+        "'no_preference' = not mentioned."
+    )
+    condition_preference: Literal["high-end", "well-kept", "no_preference"] = Field(
+        description="'high-end' = they want a recent remodel / luxury finish; "
+        "'well-kept' = clean and presentable is enough, not fancy; "
+        "'no_preference' = not mentioned."
+    )
+    wants_outdoor_space: bool = Field(
+        description="True only if they mentioned wanting a yard, patio, "
+        "balcony, deck, or other private outdoor space."
+    )
+    desired_feeling: str = Field(
+        description='Free text capturing the vibe they described, e.g. '
+        '"calm retreat, not a party layout". Empty string if nothing like '
+        "that was said."
+    )
+
+
+class PreferenceProfile(BaseModel):
+    """Structured read of a conversational preference intake — session-scoped,
+    never written back to the durable `_RANK_SYSTEM` policy. See
+    docs/how-it-works/preferences.md.
+    """
+    logistics: LogisticsProfile
+    emotional: EmotionalProfile
+
+
+class VoiceTurn(BaseModel):
+    """One turn of `casita demo --voice`: what Gemini heard, transcribed,
+    plus the preference profile updated with it. See `transcribe_and_extract`.
+    """
+    transcript: str = Field(description="What the person said, transcribed from the audio, in their own words.")
+    profile: PreferenceProfile
+    ready_to_wrap_up: bool = Field(
+        False,
+        description="True only if, given the full profile-so-far and the "
+        "conversation, there's already enough signal to make good "
+        "recommendations — most of the 9 profile fields addressed one way "
+        "or another (stated or clearly not a concern), or a few solid turns "
+        "of real signal. False whenever there's an obvious, useful gap "
+        "still worth one more question. Default to false — don't cut the "
+        "conversation short on a thin first turn."
     )
 
 
@@ -841,6 +935,355 @@ def apply_photo_review(listing: Listing, review: PhotoReview) -> None:
             listing.has_yard = True
             if not listing.yard_note:
                 listing.yard_note = review.outdoor_visible
+
+
+_EXTRACTION_EXAMPLES = textwrap.dedent("""
+    Examples — these resolve the two cases people get wrong most: mixing up
+    the logistics "notes" catch-all with the emotional "desired_feeling"
+    catch-all, and missing a second field when one sentence touches two.
+
+      1. "Somewhere that feels like a calm retreat, you know? Not a party
+         building." — Pure vibe, no checkable fact. →
+         desired_feeling="calm retreat, not a party building". Don't put
+         this in notes — there's nothing logistical here, it's all feel.
+
+      2. "I really need a washer and dryer, I am SO tired of hauling stuff
+         to the laundromat every week." — A hard, checkable fact, just
+         said with feeling. → needs_in_unit_laundry=true. The exhaustion
+         is coloring a logistics fact, not describing a vibe for the
+         place itself — it does NOT also set desired_feeling.
+
+      3. "I want a big view and somewhere bright, honestly light is huge
+         for me." — One sentence, two fields. →
+         view_preference="panoramic" AND light_preference="abundant".
+         Set both; don't stop at the first one you match.
+
+      4. "I don't want anything too small." — No field cleanly fits. →
+         notes="doesn't want anything too small". Leave min_beds null —
+         it's only for an explicit number they stated, and "not too
+         small" isn't one.
+""").strip()
+
+
+_PREFERENCES_SYSTEM = textwrap.dedent("""
+    You're reading a short typed or spoken conversation where someone
+    describes what they want in a rental. Fill out the structured profile
+    from what they actually said — don't invent or infer details they
+    didn't state.
+
+    Logistics — the same shape the rental ranker already scores:
+      - wants_trail_or_beach_access: true only if they mention wanting to be
+        near a trail, beach, hiking, or the outdoors generally.
+      - needs_in_unit_laundry: true only if they mention laundry or a
+        washer/dryer.
+      - needs_parking: true only if they mention parking, a car, or a garage.
+      - min_beds: the minimum bedroom count they state, else null.
+      - notes: anything else stated that doesn't fit the other fields — one
+        or two short lines, or "" if nothing.
+
+    Emotional — how they want the place to FEEL, not the hard facts:
+      - light_preference: "abundant" only if they say they crave natural
+        light or sun; otherwise "no_preference".
+      - view_preference: "panoramic" for a big view (ocean/skyline/bridge),
+        "open" for generally outward-facing / not blocked, else
+        "no_preference".
+      - condition_preference: "high-end" for a recent remodel / luxury feel,
+        "well-kept" for clean and presentable but not fancy, else
+        "no_preference".
+      - wants_outdoor_space: true only if they mention wanting a yard,
+        patio, balcony, deck, or other private outdoor space.
+      - desired_feeling: one short phrase capturing the vibe they described,
+        e.g. "calm retreat, not a party layout" — "" if nothing like that
+        was said.
+
+    Default to false / null / "no_preference" / "" for anything not
+    mentioned. Be conservative.
+
+    {examples}
+""").strip().format(examples=_EXTRACTION_EXAMPLES)
+
+
+def extract_preferences(transcript: str) -> PreferenceProfile | None:
+    """Read a free-text conversation transcript and fill the preference
+    schema. Session-scoped input — see docs/how-it-works/preferences.md.
+
+    Returns None on API failure (same null-handling contract as
+    `review_photos`) — never raises.
+    """
+    result = _call_structured(EXTRACT_MODEL, _PREFERENCES_SYSTEM, transcript, PreferenceProfile)
+    return result if isinstance(result, PreferenceProfile) else None
+
+
+_VOICE_TURN_SYSTEM = textwrap.dedent("""
+    You're listening to one turn of a live, spoken conversation where
+    someone describes what they want in a rental. From the AUDIO:
+      1. Transcribe exactly what they said, in their own words.
+      2. Fill out the structured preference profile — logistics and
+         emotional — using everything stated so far: any prior conversation
+         given as text context, plus this turn's audio. Don't invent or
+         infer details they didn't state.
+      3. Judge ready_to_wrap_up: true only once there's real signal on most
+         of the 9 fields below (stated, or reasonably settled as "not a
+         concern" for them) — or a few solid turns have gone by and the
+         conversation has clearly leveled off. False by default, and always
+         false on a thin first turn — don't cut the conversation short just
+         because one or two fields got filled in.
+
+    Logistics — the same shape the rental ranker already scores:
+      - wants_trail_or_beach_access: true only if they mention wanting to be
+        near a trail, beach, hiking, or the outdoors generally.
+      - needs_in_unit_laundry: true only if they mention laundry or a
+        washer/dryer.
+      - needs_parking: true only if they mention parking, a car, or a garage.
+      - min_beds: the minimum bedroom count they state, else null.
+      - notes: anything else stated that doesn't fit the other fields — one
+        or two short lines, or "" if nothing.
+
+    Emotional — how they want the place to FEEL, not the hard facts:
+      - light_preference: "abundant" only if they say they crave natural
+        light or sun; otherwise "no_preference".
+      - view_preference: "panoramic" for a big view (ocean/skyline/bridge),
+        "open" for generally outward-facing / not blocked, else
+        "no_preference".
+      - condition_preference: "high-end" for a recent remodel / luxury feel,
+        "well-kept" for clean and presentable but not fancy, else
+        "no_preference".
+      - wants_outdoor_space: true only if they mention wanting a yard,
+        patio, balcony, deck, or other private outdoor space.
+      - desired_feeling: one short phrase capturing the vibe they described,
+        "" if nothing like that was said.
+
+    Default to false / null / "no_preference" / "" for anything not
+    mentioned. Be conservative.
+
+    {examples}
+""").strip().format(examples=_EXTRACTION_EXAMPLES)
+
+
+def transcribe_and_extract(audio_bytes: bytes, *, prior_transcript: str = "") -> VoiceTurn | None:
+    """Single multimodal call: transcribe this turn's audio and extract/update
+    the preference profile against `prior_transcript` (empty string on turn 1).
+
+    Mirrors `review_photos`'s try/except/return-None-on-failure contract
+    exactly — never raises. See docs/how-it-works/preferences.md.
+    """
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        print(f"  llm config err: {e}")
+        return None
+
+    context = (
+        f"Prior conversation so far:\n{prior_transcript}\n\n"
+        "Now transcribe and extract from the new audio turn below."
+        if prior_transcript
+        else "This is the first turn — no prior conversation."
+    )
+    text_part = gtypes.Part.from_text(text=context)
+    audio_part = gtypes.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+    try:
+        resp = client.models.generate_content(
+            model=VOICE_MODEL,  # latency-sensitive — see VOICE_MODEL's definition
+            contents=[gtypes.Content(role="user", parts=[text_part, audio_part])],
+            config=gtypes.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=VoiceTurn,
+                system_instruction=_VOICE_TURN_SYSTEM,
+            ),
+        )
+        text = (resp.text or "").strip()
+        if not text:
+            return None
+        return VoiceTurn.model_validate_json(text)
+    except Exception as e:
+        print(f"  voice turn err: {str(e)[:120]}")
+        return None
+
+
+_SPOKEN_REPLY_SYSTEM = textwrap.dedent("""
+    You're a warm, empathetic voice assistant helping someone find a rental
+    home, mid-conversation. They just spoke; you're about to speak back.
+
+    Write a SHORT spoken reply — 2 to 4 sentences, meant to be heard aloud,
+    not read as a data dump.
+
+    Do:
+      - Acknowledge what they said, briefly and in their own terms.
+      - Name the top listing or two by neighborhood or title.
+      - If grounding notes are given for a listing (routing figures,
+        cross-source data conflicts), weave them into natural spoken
+        language — the way a friend would mention it in conversation, not
+        as a quoted fact or a bullet point.
+
+    Don't:
+      - List every field or number.
+      - Sound like a table read aloud.
+      - Over-apologize or over-hedge.
+
+    Ending the reply — the prompt tells you the Mode, CONTINUE or WRAP UP:
+      - CONTINUE: end with exactly ONE natural, conversational follow-up
+        question, aimed at the single most useful field marked "open" in
+        the "profile so far" list given in the prompt (beds, parking,
+        laundry, trail/beach access, light, view, condition, outdoor space,
+        overall vibe). Never ask about a field already marked "answered".
+      - WRAP UP: close warmly instead — no question, don't fish for more.
+        Sound like a natural end to this leg of the conversation, e.g. "I
+        think I've got a great picture of what you're looking for — let me
+        show you what I found."
+
+    Return only the reply text — no labels, no markdown.
+""").strip()
+
+
+def _profile_gap_lines(profile: PreferenceProfile) -> list[str]:
+    """Answered/open status for each of the 9 fields `generate_spoken_reply`
+    can ask a CONTINUE follow-up about. Feeds the "profile so far" block in
+    the prompt so the model doesn't re-ask something already stated.
+    """
+    lo, em = profile.logistics, profile.emotional
+    return [
+        f"beds: {'answered' if lo.min_beds is not None else 'open'}",
+        f"parking: {'answered' if lo.needs_parking else 'open'}",
+        f"laundry: {'answered' if lo.needs_in_unit_laundry else 'open'}",
+        f"trail/beach access: {'answered' if lo.wants_trail_or_beach_access else 'open'}",
+        f"light: {'answered' if em.light_preference != 'no_preference' else 'open'}",
+        f"view: {'answered' if em.view_preference != 'no_preference' else 'open'}",
+        f"condition: {'answered' if em.condition_preference != 'no_preference' else 'open'}",
+        f"outdoor space: {'answered' if em.wants_outdoor_space else 'open'}",
+        f"overall vibe: {'answered' if em.desired_feeling else 'open'}",
+    ]
+
+
+def generate_spoken_reply(
+    transcript: str,
+    profile: PreferenceProfile,
+    ranked: list[tuple[Listing, int, int]],
+    explanations: list[str],
+    *,
+    wrap_up: bool = False,
+) -> str:
+    """The "sympathize" turn: a short, warm spoken reply naming the top
+    listing(s), folding in `session_prefs.explain_listing()`'s routing/
+    conflict narration, and either steering toward the most useful open
+    profile field (`wrap_up=False`, the default) or closing the conversation
+    warmly with no question (`wrap_up=True`, used on the turn that ends the
+    `--voice` loop). Freeform text, not structured JSON.
+
+    Returns a safe, plain fallback string on any failure — never None, never
+    raises — so the voice loop always has something to hand to
+    `synthesize_speech`.
+    """
+    if not ranked:
+        return "I didn't find any listings to show yet — tell me a bit about what you're looking for."
+
+    top = ranked[:2]
+    fallback = f"Here's what I found — {top[0][0].title or top[0][0].address or top[0][0].key}."
+
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        print(f"  llm config err: {e}")
+        return fallback
+
+    lines = []
+    for i, (listing, _base, _bonus) in enumerate(top):
+        bits = [listing.title or listing.address or listing.key]
+        if listing.hood:
+            bits.append(listing.hood)
+        if listing.price:
+            bits.append(f"${listing.price}/mo")
+        line = " · ".join(bits)
+        note = explanations[i] if i < len(explanations) else ""
+        if note:
+            line += f" (grounding note to weave in: {note})"
+        lines.append(f"{i + 1}. {line}")
+
+    mode = "WRAP UP — close warmly, no question." if wrap_up else "CONTINUE — end with one follow-up question."
+    prompt = (
+        f'What they just said: "{transcript}"\n\n'
+        "Top listing(s) for this session, with any grounding notes — don't "
+        "quote the notes verbatim, work them into natural spoken language:\n"
+        + "\n".join(lines)
+        + "\n\nProfile so far (answered vs. open):\n"
+        + "\n".join(f"- {line}" for line in _profile_gap_lines(profile))
+        + f"\n\nMode: {mode}"
+    )
+    try:
+        resp = client.models.generate_content(
+            model=VOICE_MODEL,
+            contents=[gtypes.Content(role="user", parts=[gtypes.Part.from_text(text=prompt)])],
+            config=gtypes.GenerateContentConfig(
+                temperature=0.4,
+                system_instruction=_SPOKEN_REPLY_SYSTEM,
+            ),
+        )
+        reply = (resp.text or "").strip()
+        return reply if reply else fallback
+    except Exception as e:
+        print(f"  spoken reply err: {str(e)[:120]}")
+        return fallback
+
+
+def _pcm_to_wav(pcm: bytes, *, sample_rate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+_TTS_FALLBACK_SAMPLE_RATE = 24000
+
+
+def _silence_wav(seconds: float = 0.3) -> bytes:
+    frame_count = int(_TTS_FALLBACK_SAMPLE_RATE * seconds)
+    return _pcm_to_wav(b"\x00\x00" * frame_count, sample_rate=_TTS_FALLBACK_SAMPLE_RATE)
+
+
+def synthesize_speech(text: str) -> bytes:
+    """Text-to-speech via Gemini's native audio output — same `google-genai`
+    Vertex client and credential the rest of this file already requires, no
+    new credential type. `GenerateContentConfig(response_modalities=["AUDIO"])`
+    is supported by the installed google-genai>=2.3.0 SDK (confirmed against
+    its `types.py`: `SpeechConfig`/`VoiceConfig`/`PrebuiltVoiceConfig` exist),
+    so this stays on the same live surface instead of adding a second API.
+
+    Returns WAV bytes `voice.play_audio()` can play directly. Falls back to a
+    short silence clip on failure — never raises, never returns None, so the
+    caller always has something to pass to playback.
+    """
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        print(f"  llm config err: {e}")
+        return _silence_wav()
+
+    try:
+        resp = client.models.generate_content(
+            model=TTS_MODEL,
+            contents=text,
+            config=gtypes.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=gtypes.SpeechConfig(
+                    voice_config=gtypes.VoiceConfig(
+                        prebuilt_voice_config=gtypes.PrebuiltVoiceConfig(voice_name=TTS_VOICE)
+                    )
+                ),
+            ),
+        )
+        part = resp.candidates[0].content.parts[0]
+        pcm = part.inline_data.data
+        mime = part.inline_data.mime_type or ""
+    except Exception as e:
+        print(f"  tts err: {str(e)[:120]}")
+        return _silence_wav()
+
+    rate_match = re.search(r"rate=(\d+)", mime)
+    rate = int(rate_match.group(1)) if rate_match else _TTS_FALLBACK_SAMPLE_RATE
+    return _pcm_to_wav(pcm, sample_rate=rate)
 
 
 _SHARE_BLURB_SYSTEM = textwrap.dedent("""

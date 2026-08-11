@@ -41,3 +41,11 @@ from the local SQLite file, but it still deploys to Firebase; set
     Google Maps Routes API when `GOOGLE_MAPS_API_KEY` is set. The demo is free:
     it reads cached route rows from `fixtures/demo.sqlite`. Without a Maps key,
     live route calculations fall back to haversine estimates.
+
+!!! note "Voice demo needs PortAudio"
+
+    `casita demo --voice` (see [Preferences](how-it-works/preferences.md)) records
+    and plays audio through `sounddevice`, which binds to the system PortAudio
+    library. Install it once at the OS level — `brew install portaudio` on
+    macOS — before using `--voice`. The base `casita demo` and `--intake`
+    paths don't need it.

@@ -14,6 +14,7 @@ read-only renders (issue #4).
 import math
 import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,6 +129,17 @@ def _haversine_drive_minutes(lat: float, lng: float, anchor: Anchor) -> int:
 _DEFAULT_CACHE_DB = Path.home() / ".casita" / "routes_cache.sqlite"
 _cache_connection: sqlite3.Connection | None = None
 _cache_connection_path: Path | None = None
+# `casita demo` renders the site (creating this connection on the main
+# thread) before the threaded HTTP server starts; a POST /api/chat request
+# then reaches populate_for() from its own request thread (each request
+# gets one — see _rendered_site_server()'s ThreadingMixIn). sqlite3
+# connections default to check_same_thread=True, so without this lock and
+# check_same_thread=False, that second thread touching the same connection
+# raises "SQLite objects created in a thread can only be used in that same
+# thread."
+# Reentrant: _cache_get()/_cache_put() hold the lock across their own call
+# into _cache_conn(), which also takes it.
+_cache_lock = threading.RLock()
 
 
 def _cache_db_path() -> Path:
@@ -137,14 +149,15 @@ def _cache_db_path() -> Path:
 def _cache_conn() -> sqlite3.Connection:
     global _cache_connection, _cache_connection_path
     path = _cache_db_path()
-    if _cache_connection is None or _cache_connection_path != path:
-        if _cache_connection is not None:
-            _cache_connection.close()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _cache_connection = sqlite3.connect(path)
-        _cache_connection_path = path
-        _ensure_cache(_cache_connection)
-    return _cache_connection
+    with _cache_lock:
+        if _cache_connection is None or _cache_connection_path != path:
+            if _cache_connection is not None:
+                _cache_connection.close()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _cache_connection = sqlite3.connect(path, check_same_thread=False)
+            _cache_connection_path = path
+            _ensure_cache(_cache_connection)
+        return _cache_connection
 
 
 def _ensure_cache(conn: sqlite3.Connection) -> None:
@@ -192,21 +205,24 @@ def _cache_get(
     fl: float, fn: float, tl: float, tn: float,
     mode: str = "walk",
 ) -> int | None:
-    row = _cache_conn().execute(
-        "SELECT minutes FROM walk_cache "
-        "WHERE from_lat=? AND from_lng=? AND to_lat=? AND to_lng=? AND mode=?",
-        (_rnd(fl), _rnd(fn), _rnd(tl), _rnd(tn), mode),
-    ).fetchone()
+    with _cache_lock:
+        row = _cache_conn().execute(
+            "SELECT minutes FROM walk_cache "
+            "WHERE from_lat=? AND from_lng=? AND to_lat=? AND to_lng=? AND mode=?",
+            (_rnd(fl), _rnd(fn), _rnd(tl), _rnd(tn), mode),
+        ).fetchone()
     return row[0] if row else None
 
 
 def _cache_put(fl, fn, tl, tn, minutes: int, source: str, mode: str = "walk") -> None:
-    _cache_conn().execute(
-        "INSERT OR REPLACE INTO walk_cache "
-        "(from_lat,from_lng,to_lat,to_lng,mode,minutes,source) VALUES (?,?,?,?,?,?,?)",
-        (_rnd(fl), _rnd(fn), _rnd(tl), _rnd(tn), mode, minutes, source),
-    )
-    _cache_conn().commit()
+    with _cache_lock:
+        conn = _cache_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO walk_cache "
+            "(from_lat,from_lng,to_lat,to_lng,mode,minutes,source) VALUES (?,?,?,?,?,?,?)",
+            (_rnd(fl), _rnd(fn), _rnd(tl), _rnd(tn), mode, minutes, source),
+        )
+        conn.commit()
 
 
 # ---------- Routes API ----------

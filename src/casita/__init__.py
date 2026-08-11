@@ -1,9 +1,13 @@
 import asyncio
 import contextlib
+import io
 import os
+import re
 import sqlite3
 import subprocess
+import time
 import urllib.parse
+import wave
 from pathlib import Path
 
 import click
@@ -11,7 +15,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from . import craigslist, dedup, html, llm, redfin, storage, walk, zillow, zumper
+from . import chat_api, craigslist, dedup, html, llm, redfin, session_prefs, storage, walk, zillow, zumper
 from .browser import context
 from .models import Listing
 from .rank import rank, score
@@ -620,31 +624,12 @@ def _enrich_impl(force: bool):
         console.print(f"[green]ranked:[/green] ok={counts['ok']} concerns={counts['concerns']} filtered={counts['filtered']}")
 
 
-def _vote_scores(conn) -> dict[str, int]:
-    """Net distinct-voter score per listing: latest vote per voter, up=+1/down=-1.
-    Drives the favorites (net>0) top bucket in rank()."""
-    rows = conn.execute(
-        """WITH latest AS (
-             SELECT listing_key, voter, direction,
-                    ROW_NUMBER() OVER (PARTITION BY listing_key, voter
-                                       ORDER BY ts DESC, id DESC) AS rn
-             FROM votes
-           )
-           SELECT listing_key,
-                  SUM(CASE WHEN direction='up' THEN 1
-                           WHEN direction='down' THEN -1 ELSE 0 END)
-           FROM latest WHERE rn = 1 GROUP BY listing_key"""
-    ).fetchall()
-    return {r[0]: r[1] for r in rows}
-
-
 @cli.command()
 def show():
     """Show current active listings from the DB."""
     with storage.connect() as conn:
-        status_map = {r[0]: r[1] for r in conn.execute("SELECT listing_key, status FROM listing_status")}
-        listings = rank(storage.active_listings(conn), status_map=status_map,
-                        vote_scores=_vote_scores(conn))
+        listings = rank(storage.active_listings(conn), status_map=storage.status_map(conn),
+                        vote_scores=storage.vote_scores(conn))
         run = storage.latest_run(conn)
     if run:
         console.print(f"last run #{run['id']} at {run['finished_at']}")
@@ -708,6 +693,7 @@ def _demo_clean_url_path(path: str, translated: str | Path) -> str:
 def _rendered_site_handler(output_dir: Path):
     import functools
     import http.server
+    import json
 
     class RenderedSiteHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         def translate_path(self, path: str) -> str:
@@ -716,6 +702,44 @@ def _rendered_site_handler(output_dir: Path):
         def log_message(self, format: str, *args) -> None:
             if os.environ.get("CASITA_HTTP_LOGS"):
                 super().log_message(format, *args)
+
+        def _send_json(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            # The chat mode's two endpoints — everything else 404s. Wrapped
+            # in a blanket try/except so a bad body or an unexpected error
+            # in chat_api can never take down the demo server's thread (each
+            # request already runs on its own thread via ThreadingMixIn, but
+            # an unhandled exception here would still surface as a broken
+            # response instead of a clean JSON error).
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    self._send_json(400, {"error": "malformed JSON body"})
+                    return
+
+                if self.path == "/api/chat":
+                    message = body.get("message") if isinstance(body, dict) else None
+                    if not isinstance(message, str) or not message.strip():
+                        self._send_json(400, {"error": "missing 'message'"})
+                        return
+                    self._send_json(200, chat_api.handle_message(message))
+                elif self.path == "/api/chat/reset":
+                    chat_api.reset_session()
+                    self._send_json(200, {"ok": True})
+                else:
+                    self._send_json(404, {"error": "not found"})
+            except Exception as e:
+                self._send_json(500, {"error": f"server error: {str(e)[:200]}"})
 
     return functools.partial(RenderedSiteHTTPRequestHandler, directory=str(output_dir))
 
@@ -1048,17 +1072,93 @@ def _generate_og_images(output_dir: Path, listings: list[Listing], run=None) -> 
     return count
 
 
-def _render_site(filename: str, output_dir: Path) -> dict[str, int | Path]:
+# What a completed intake/voice session hands back to `demo()` so the
+# rendered site can reflect it — the last successfully extracted profile,
+# paired with that round's `session_prefs.rerank_with_profile()` result.
+# `None` means nothing usable was ever collected (blank session, or every
+# extraction attempt failed).
+_SessionResult = tuple[llm.PreferenceProfile, list[tuple[Listing, int, int]]] | None
+
+
+def _render_site(
+    filename: str, output_dir: Path, session_result: _SessionResult = None,
+) -> dict[str, int | Path]:
+    """Render the active listings to a static site.
+
+    `session_result` — the (profile, ranked) pair `_run_intake()`/
+    `_run_voice()` return — is optional and, when present, reorders the
+    rendered listings to match that session's re-rank instead of the
+    durable `rank()` order. Session-only: it never touches `rank.py`,
+    `llm_rank`, votes, or any other run's render. See
+    docs/how-it-works/preferences.md.
+    """
     with storage.connect() as conn:
         # Cross-source dedup across the whole active set BEFORE we render —
         # catches duplicates that landed in separate scrape runs.
         deactivated = dedup.deduplicate_db(conn)
         if deactivated:
             console.print(f"[bold]dedup:[/bold] deactivated {deactivated} duplicate listings")
-        status_rows = conn.execute("SELECT listing_key, status FROM listing_status").fetchall()
-        status_map = {r[0]: r[1] for r in status_rows}
+        status_map = storage.status_map(conn)
+        vote_scores = storage.vote_scores(conn)
         listings = rank(storage.active_listings(conn), status_map=status_map,
-                        vote_scores=_vote_scores(conn))
+                        vote_scores=vote_scores)
+        session_banner = ""
+        if session_result is not None:
+            # Reorder within `rank()`'s durable buckets only, never across
+            # them — see session_prefs.durable_bucket() and "Showing It, Not
+            # Just Saying It" in docs/how-it-works/preferences.md.
+            _, session_ranked = session_result
+            session_score = {L.key: base + bonus for L, base, bonus in session_ranked}
+            session_bonus = {L.key: bonus for L, base, bonus in session_ranked}
+            all_count = len(listings)
+            listings = sorted(
+                listings,
+                key=lambda L: (
+                    session_prefs.durable_bucket(L, status_map, vote_scores),
+                    -session_score.get(L.key, -10**9),
+                ),
+            )
+            # Filter the grid down to a firm top-N of what actually matched
+            # — a broad "matched anything at all" threshold looked barely
+            # filtered once a longer conversation touched several fields
+            # (100+ of 143 could pass). Pipeline/favorite listings are real
+            # household leads independent of one session's stated
+            # preference, so they're always shown on top of, not instead
+            # of, the top matches; eliminated listings stay hidden either
+            # way. If nothing matched at all, fall back to the full
+            # reordered list rather than an almost-empty page.
+            _TOP_N_MATCHES = 10
+            _ALWAYS_SHOW = {-2, -1}  # pipeline, favorites
+            _ALWAYS_HIDE = {3}       # eliminated
+            pipeline_favorites = [
+                L for L in listings
+                if session_prefs.durable_bucket(L, status_map, vote_scores) in _ALWAYS_SHOW
+            ]
+            rest_matched = [
+                L for L in listings
+                if session_prefs.durable_bucket(L, status_map, vote_scores) not in _ALWAYS_SHOW | _ALWAYS_HIDE
+                and session_bonus.get(L.key, 0) > 0
+            ]
+            top_matches = rest_matched[:_TOP_N_MATCHES]
+            shown = pipeline_favorites + top_matches
+            if top_matches or pipeline_favorites:
+                listings = shown
+                parts = []
+                if top_matches:
+                    parts.append(f"top {len(top_matches)} match" + ("es" if len(top_matches) != 1 else ""))
+                if pipeline_favorites:
+                    parts.append(f"{len(pipeline_favorites)} active pipeline/favorite listing"
+                                  + ("s" if len(pipeline_favorites) != 1 else ""))
+                session_banner = (
+                    f"Showing your <strong>{' + '.join(parts)}</strong> out of {all_count} — "
+                    "filtered to what you told the agent this session. Session-only: run "
+                    "<code>casita demo</code> without a flag to see everything again."
+                )
+            else:
+                session_banner = (
+                    "Nothing matched what you said closely enough to filter meaningfully — "
+                    f"showing all {all_count}, reordered around it instead."
+                )
         run = storage.latest_run(conn)
         walk_map = walk.populate_for(listings)
         drive_map = walk.populate_drive_for_marin(listings)
@@ -1079,6 +1179,9 @@ def _render_site(filename: str, output_dir: Path) -> dict[str, int | Path]:
 <body><p>No listings in DB. Run <code>casita search</code> first.</p></body>
 </html>
 """)
+        chat_dir = output_dir / "chat"
+        chat_dir.mkdir(exist_ok=True)
+        (chat_dir / "index.html").write_text(html.render_chat())
         return {
             "out_html": out_html,
             "listings": 0,
@@ -1094,6 +1197,7 @@ def _render_site(filename: str, output_dir: Path) -> dict[str, int | Path]:
     out_html.write_text(html.render(
         listings, run=run, walk_map=walk_map, convo_map=convo_map,
         drive_bakery_map=drive_bakery_map, drive_map=drive_map,
+        session_banner=session_banner,
     ))
 
     # Per-listing detail pages — one file per active listing under tmp/listing/.
@@ -1113,6 +1217,12 @@ def _render_site(filename: str, output_dir: Path) -> dict[str, int | Path]:
 
     _copy_static_assets(output_dir)
 
+    # /chat/ — the third preference-agent mode (live, in-browser TEXT chat,
+    # no CLI flag; see chat_api.py). Always rendered, same as /listing/*.
+    chat_dir = output_dir / "chat"
+    chat_dir.mkdir(exist_ok=True)
+    (chat_dir / "index.html").write_text(html.render_chat())
+
     # Mirror screenshots into the served tree at tmp/shots/.
     import shutil
     src_shots = ROOT / "screenshots"
@@ -1131,6 +1241,8 @@ def _render_site(filename: str, output_dir: Path) -> dict[str, int | Path]:
         f"{detail_count} detail pages, "
         f"{og_count} og images)"
     )
+    if session_result is not None:
+        console.print(f"[dim]{re.sub('<[^>]+>', '', session_banner)}[/dim]")
     return {
         "out_html": out_html,
         "listings": len(listings),
@@ -1161,6 +1273,288 @@ def _publish_impl(project: str | None, filename: str):
         console.print(f"\n[green]live:[/green] {site_url.rstrip('/')}")
 
 
+def _collect_transcript(intro: str) -> str:
+    """Terminal loop: prompt "You: " until a blank line or literal "done"."""
+    console.print(f"[bold]{intro}[/bold]")
+    lines: list[str] = []
+    while True:
+        line = input("You: ")
+        if not line.strip() or line.strip().lower() == "done":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _print_preference_profile(profile: llm.PreferenceProfile) -> None:
+    lo, em = profile.logistics, profile.emotional
+    table = Table(title="extracted preference profile")
+    table.add_column("field")
+    table.add_column("value")
+    table.add_row("wants trail/beach access", str(lo.wants_trail_or_beach_access))
+    table.add_row("needs in-unit laundry", str(lo.needs_in_unit_laundry))
+    table.add_row("needs parking", str(lo.needs_parking))
+    table.add_row("min beds", str(lo.min_beds) if lo.min_beds is not None else "?")
+    table.add_row("logistics notes", lo.notes or "")
+    table.add_row("light preference", em.light_preference)
+    table.add_row("view preference", em.view_preference)
+    table.add_row("condition preference", em.condition_preference)
+    table.add_row("wants outdoor space", str(em.wants_outdoor_space))
+    table.add_row("desired feeling", em.desired_feeling or "")
+    console.print(table)
+
+
+def _print_reranked_table(ranked: list[tuple[Listing, int, int]], limit: int = 10) -> None:
+    table = Table(title=f"session re-rank — top {min(limit, len(ranked))} of {len(ranked)}")
+    for col in ["base", "bonus", "total", "title"]:
+        table.add_column(col)
+    for L, base, bonus in ranked[:limit]:
+        table.add_row(str(base), str(bonus), str(base + bonus), (L.title or L.address or "")[:60])
+    console.print(table)
+
+
+def _print_explanations(
+    ranked: list[tuple[Listing, int, int]],
+    profile: llm.PreferenceProfile,
+    walk_map: dict | None,
+    limit: int = 5,
+) -> list[str]:
+    """Grounded route/conflict narration for the top few listings — kept to
+    5 (not the full top-10 table) so terminal output stays readable.
+
+    Returns the explanation strings it printed (skipping listings with
+    nothing to say) so callers like `_run_voice()` can feed them straight
+    into `llm.generate_spoken_reply()` without re-deriving them.
+    """
+    explanations: list[str] = []
+    for L, _, _ in ranked[:limit]:
+        text = session_prefs.explain_listing(L, profile, walk_map)
+        if text:
+            console.print(f"[dim]{(L.title or L.address or L.key)[:60]}:[/dim] {text}")
+            explanations.append(text)
+    return explanations
+
+
+def _run_intake() -> _SessionResult:
+    """Collect a typed preference conversation, print the session re-rank,
+    and return the last successful (profile, ranked) pair so `demo()` can
+    re-render the site around it (see docs/how-it-works/preferences.md).
+
+    This is a real multi-turn loop: each non-blank turn re-extracts a
+    preference profile from the FULL cumulative transcript (all turns
+    joined, not just the newest one) and reprints the session re-rank, so
+    later turns can refine or add to earlier ones. A blank line or "done"
+    on the first turn skips straight out (nothing to rank yet); on any
+    later turn it just stops the loop, leaving the last round's results
+    on screen and returning them. If a later round's extraction fails,
+    the previous round's results are still returned rather than discarded.
+    """
+    transcript_parts: list[str] = []
+    intro = "Tell me what you're looking for. Blank line or 'done' to finish."
+    first_turn = True
+    profile: llm.PreferenceProfile | None = None
+    ranked: list[tuple[Listing, int, int]] = []
+
+    def _result() -> _SessionResult:
+        return (profile, ranked) if profile is not None else None
+
+    while True:
+        turn_text = _collect_transcript(intro)
+        if turn_text.strip():
+            transcript_parts.append(turn_text)
+        elif not first_turn:
+            break  # blank/done on a refinement turn → stop, keep last results on screen
+        first_turn = False
+
+        full_transcript = "\n".join(transcript_parts)
+        if not full_transcript.strip():
+            console.print("[yellow]no preferences entered — skipping session re-rank[/yellow]")
+            return _result()
+
+        new_profile = llm.extract_preferences(full_transcript)
+        if new_profile is None:
+            console.print(
+                "[red]couldn't extract a preference profile "
+                "(check Gemini credentials) — skipping session re-rank[/red]"
+            )
+            return _result()
+        profile = new_profile
+        _print_preference_profile(profile)
+        with storage.connect() as conn:
+            listings = storage.active_listings(conn)
+            status_map = storage.status_map(conn)
+            vote_scores = storage.vote_scores(conn)
+        walk_map = walk.populate_for(listings)
+        ranked = session_prefs.rerank_with_profile(listings, walk_map, profile)
+        # Same bucket-aware sort the site render and /chat/ use — a session
+        # preference alone should never surface a declined/eliminated
+        # listing as a top recommendation here, printed or spoken back.
+        ranked.sort(key=lambda t: (
+            session_prefs.durable_bucket(t[0], status_map, vote_scores), -(t[1] + t[2]),
+        ))
+        _print_reranked_table(ranked)
+        _print_explanations(ranked, profile, walk_map)
+
+        intro = "Anything to add or change? Blank line or 'done' to finish."
+
+    return _result()
+
+
+# Case-insensitive, word-bounded spoken sign-off phrases — the voice
+# equivalent of _collect_transcript's typed "done". Matched against the
+# transcript Gemini returns from transcribe_and_extract, never against raw
+# audio, so it only fires on words the person actually said.
+_VOICE_SIGN_OFF_RE = re.compile(
+    r"\b(done|that.s all|that.s it|i.m good|stop)\b", re.IGNORECASE
+)
+
+_VOICE_INTRO = (
+    "Tell me about the place you're looking for — beds, parking, laundry, "
+    "trail or beach access, and how you want it to feel: light, view, vibe."
+)
+_VOICE_MAX_SECONDS = 15 * 60  # hard cap on total conversation length
+
+
+def _voice_turn_is_silent(audio_bytes: bytes) -> bool:
+    """True if `voice.record_turn()` captured zero samples — the push-to-talk
+    equivalent of a blank typed line (Enter to start, Enter again with
+    nothing said in between).
+    """
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+        return wf.getnframes() == 0
+
+
+def _run_voice() -> _SessionResult:
+    """Collect a spoken preference conversation, print the session re-rank,
+    speak a warm reply back after each turn, and return the last successful
+    (profile, ranked) pair so `demo()` can re-render the site around it.
+
+    Mirrors `_run_intake()`'s loop shape, swapping typed collection for
+    `voice.record_turn()` push-to-talk capture and adding a spoken-reply
+    step. Unlike `_run_intake`, this is a guided conversation: the first-turn
+    prompt names the fields
+    worth covering, and each spoken reply either asks one natural follow-up
+    targeting the most useful open field or, once enough signal is in,
+    closes warmly instead.
+
+    Four ways a turn/the loop can end:
+      1. Silent audio (zero samples) — the direct voice equivalent of a
+         blank typed line. Detected before any Gemini call, so a silent
+         turn never calls `transcribe_and_extract`.
+      2. A spoken sign-off phrase ("done", "that's all", "that's it", "i'm
+         good", "stop") as a standalone word/phrase in the transcript.
+         Only knowable AFTER transcribing, so this check happens post-call.
+      3. Gemini's own judgment (`turn.ready_to_wrap_up`) that there's
+         already enough signal to make good recommendations.
+      4. A hard 15-minute wall-clock cap on the whole conversation, checked
+         at the top of each loop iteration before recording another turn.
+
+    Signals 1 and 2 follow the same first-turn-vs-later-turn rule
+    `_run_intake` uses: on turn 1, either one with nothing else useful
+    captured means skip straight out with the same style of message
+    `_run_intake` uses (nothing to rank yet, nothing to speak). On a later
+    turn — or for signals 3 and 4, which by construction can't fire before
+    a turn has completed — the loop stops after speaking a warm,
+    no-question wrap-up (`generate_spoken_reply(..., wrap_up=True)`) built
+    from whatever profile/ranked/transcript state the last completed turn
+    left behind. If a sign-off or wrap-up-ready turn ALSO contains real
+    preference content in the same turn ("I need parking too, that's all"),
+    that content is processed first — extracted, reranked, printed, and
+    spoken back with `wrap_up=True` — before the loop stops; goodbye
+    doesn't erase what was said in the same breath.
+    """
+    from . import voice  # local: keep sounddevice out of the base demo import path
+
+    start = time.monotonic()
+    transcript_parts: list[str] = []
+    intro = _VOICE_INTRO
+    first_turn = True
+    # State from the last completed (non-empty, non-sign-off-only) turn —
+    # used to build a wrap-up reply for the silence/sign-off-alone/timeout
+    # exits, none of which have fresh state of their own.
+    profile: llm.PreferenceProfile | None = None
+    ranked: list[tuple[Listing, int, int]] = []
+    explanations: list[str] = []
+    last_transcript = ""
+
+    def _speak_wrap_up() -> None:
+        reply_text = llm.generate_spoken_reply(last_transcript, profile, ranked, explanations, wrap_up=True)
+        audio_reply = llm.synthesize_speech(reply_text)
+        voice.play_audio(audio_reply)
+
+    def _result() -> _SessionResult:
+        return (profile, ranked) if profile is not None else None
+
+    while True:
+        if time.monotonic() - start >= _VOICE_MAX_SECONDS:
+            if profile is not None:
+                _speak_wrap_up()
+            else:
+                console.print("[yellow]no preferences entered — skipping session re-rank[/yellow]")
+            return _result()
+
+        console.print(f"[bold]{intro}[/bold]")
+        audio = voice.record_turn()
+
+        if _voice_turn_is_silent(audio):
+            if not first_turn:
+                _speak_wrap_up()
+                break  # silence on a refinement turn → wrap up, keep last results on screen
+            console.print("[yellow]no preferences entered — skipping session re-rank[/yellow]")
+            return _result()
+
+        turn = llm.transcribe_and_extract(audio, prior_transcript="\n".join(transcript_parts))
+        if turn is None:
+            console.print(
+                "[red]couldn't transcribe/extract that turn "
+                "(check Gemini credentials) — skipping session re-rank[/red]"
+            )
+            return _result()
+
+        sign_off_match = _VOICE_SIGN_OFF_RE.search(turn.transcript)
+        remainder = _VOICE_SIGN_OFF_RE.sub("", turn.transcript).strip(" ,.!?-") if sign_off_match else turn.transcript
+        has_real_content = bool(remainder.strip())
+
+        if sign_off_match and not has_real_content:
+            if first_turn:
+                console.print("[yellow]no preferences entered — skipping session re-rank[/yellow]")
+                return _result()
+            _speak_wrap_up()
+            break  # sign-off alone on a refinement turn → wrap up, keep last results on screen
+
+        transcript_parts.append(turn.transcript)
+        profile = turn.profile
+        last_transcript = turn.transcript
+        _print_preference_profile(profile)
+        with storage.connect() as conn:
+            listings = storage.active_listings(conn)
+            status_map = storage.status_map(conn)
+            vote_scores = storage.vote_scores(conn)
+        walk_map = walk.populate_for(listings)
+        ranked = session_prefs.rerank_with_profile(listings, walk_map, profile)
+        # Same bucket-aware sort the site render and /chat/ use — a session
+        # preference alone should never surface a declined/eliminated
+        # listing as a top recommendation, printed or SPOKEN back to the
+        # person by generate_spoken_reply() below.
+        ranked.sort(key=lambda t: (
+            session_prefs.durable_bucket(t[0], status_map, vote_scores), -(t[1] + t[2]),
+        ))
+        _print_reranked_table(ranked)
+        explanations = _print_explanations(ranked, profile, walk_map)
+
+        should_stop = bool(sign_off_match) or turn.ready_to_wrap_up
+        reply_text = llm.generate_spoken_reply(turn.transcript, profile, ranked, explanations, wrap_up=should_stop)
+        audio_reply = llm.synthesize_speech(reply_text)
+        voice.play_audio(audio_reply)
+
+        first_turn = False
+        if should_stop:
+            break  # real content this turn, but goodbye/ready-to-wrap-up → stop after processing
+
+        intro = "Anything to add or change?"
+
+    return _result()
+
+
 @cli.command()
 @click.option(
     "--fixture",
@@ -1170,7 +1564,23 @@ def _publish_impl(project: str | None, filename: str):
 )
 @click.option("--host", default="127.0.0.1", help="HTTP bind host.")
 @click.option("--port", default=8765, help="HTTP port; intentionally not 8000.")
-def demo(fixture: Path, host: str, port: int):
+@click.option(
+    "--intake",
+    is_flag=True,
+    help="Collect a typed preference conversation first, then render the "
+    "site with this session's listing order reflecting it.",
+)
+@click.option(
+    "--voice",
+    "voice_",
+    is_flag=True,
+    help="Collect a spoken preference conversation first (push-to-talk), "
+    "speaking a reply back after each turn, then render the site with "
+    "this session's listing order reflecting it. Requires PortAudio "
+    "(sounddevice) and Gemini credentials — not part of the "
+    "credentials-free base demo path.",
+)
+def demo(fixture: Path, host: str, port: int, intake: bool, voice_: bool):
     """Render the committed fixture and serve it locally without credentials."""
     import shutil
 
@@ -1192,7 +1602,12 @@ def demo(fixture: Path, host: str, port: int):
     previous = {k: os.environ.get(k) for k in env_updates}
     try:
         os.environ.update(env_updates)
-        _render_site("index.html", output_dir)
+        session_result: _SessionResult = None
+        if intake:
+            session_result = _run_intake()
+        if voice_:
+            session_result = _run_voice()
+        _render_site("index.html", output_dir, session_result=session_result)
     finally:
         for key, value in previous.items():
             if value is None:

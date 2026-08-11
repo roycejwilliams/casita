@@ -396,6 +396,32 @@ def active_listings(conn) -> list[Listing]:
     return [_row_to_listing(r) for r in rows]
 
 
+def status_map(conn) -> dict[str, str]:
+    """listing_key -> CRM status ("contacted", "declined_by_landlord", ...),
+    for every listing that has one. Feeds `rank.rank()`'s pipeline/eliminated
+    buckets and `session_prefs.durable_bucket()`."""
+    rows = conn.execute("SELECT listing_key, status FROM listing_status").fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def vote_scores(conn) -> dict[str, int]:
+    """Net distinct-voter score per listing: latest vote per voter, up=+1/down=-1.
+    Drives the favorites (net>0) bucket in `rank.rank()` and `session_prefs.durable_bucket()`."""
+    rows = conn.execute(
+        """WITH latest AS (
+             SELECT listing_key, voter, direction,
+                    ROW_NUMBER() OVER (PARTITION BY listing_key, voter
+                                       ORDER BY ts DESC, id DESC) AS rn
+             FROM votes
+           )
+           SELECT listing_key,
+                  SUM(CASE WHEN direction='up' THEN 1
+                           WHEN direction='down' THEN -1 ELSE 0 END)
+           FROM latest WHERE rn = 1 GROUP BY listing_key"""
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def latest_run(conn) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM runs ORDER BY id DESC LIMIT 1"
