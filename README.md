@@ -14,14 +14,16 @@ uv run casita demo
 
 Open <http://127.0.0.1:8765/>.
 
-To try the conversational agent:
+The conversational agent needs real Gemini credentials to actually respond, whichever way you reach it (see "Environment setup" below):
 
 ```bash
-uv run casita demo --intake   # type what you want, no credentials needed
-uv run casita demo --voice    # say what you want, needs Gemini credentials and a mic
+uv run casita demo --intake   # type what you want
+uv run casita demo --voice    # say what you want, also needs a mic
 ```
 
-`/chat/` is also live on the running demo site. No flag needed, just click "chat" on the page.
+`/chat/` is also live on the running demo site (click "chat" on the page), no flag needed, but it calls the same live Gemini extraction under the hood, so it needs credentials too.
+
+Without credentials, `--intake`, `--voice`, and `/chat/` all fail cleanly with an error instead of crashing. Only the bare `casita demo` with no flags is fully credential-free.
 
 ## What it does
 
