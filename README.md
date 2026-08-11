@@ -33,7 +33,7 @@ Without credentials, `--intake`, `--voice`, and `/chat/` all fail cleanly with a
 - Computes walking and driving times to curated SF and Marin anchors: trails, beaches, bakeries.
 - Renders a static site with an index page and a detail page per listing.
 - Tracks up and down votes so a human can review revealed preference and hand-edit the ranking policy.
-- Talks or types with you about what you want (voice, typed terminal, or live browser chat) and reorders the listings around it for that session.
+- Talks or types with you about what you want (voice, typed terminal, or live browser chat) and shows the listings that actually match, for that session only.
 
 ## Architecture
 
@@ -87,6 +87,8 @@ Ranking already had two layers before this feature: a scoring function with fixe
 The conversational agent adds a third layer that only runs for the current session: extract what was said, add it as a bonus on top of the existing score, and never let it override the hard gate. A listing with no dogs allowed is still a hard no, no matter how well it otherwise matches what someone said about wanting good light.
 
 The agent also respects the same priority the rest of the site already uses. A listing already declined by a landlord, or one actively being pursued in the CRM pipeline, keeps that status no matter what gets said in one conversation. A stated preference can move things around inside a tier. It can't rescue a dead lead or bury an active one.
+
+After `--intake`/`--voice` finish, the site doesn't just reorder, it filters. Showing all the listings loosely reshuffled made a stated preference nearly impossible to notice, so the render now shows a firm top 10 of what matched, plus every active pipeline or favorited listing regardless of score, with a banner on the page explaining exactly what got filtered and why. `/chat/` works differently: it doesn't touch the homepage grid at all, it shows its own live-updating top 10 in the chat page itself.
 
 More detail lives in [`docs/how-it-works/preferences.md`](docs/how-it-works/preferences.md) and the full build history in [`docs/build-log.md`](docs/build-log.md).
 
