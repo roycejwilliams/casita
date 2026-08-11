@@ -103,20 +103,44 @@ More detail lives in [`docs/how-it-works/preferences.md`](docs/how-it-works/pref
 
 ## Environment setup
 
-The base demo needs nothing. `uv run casita demo` runs off a committed fixture and never calls a live API.
+The base demo needs nothing. `uv run casita demo` runs off a committed fixture and never calls a live API. Everything below is only for live search, ranking, or the conversational agent with real Gemini.
 
-For live search, ranking, or the conversational agent with real Gemini:
+1. Get the `gcloud` CLI if you don't have it:
 
-```bash
-cp .env.example .env
-```
+   ```bash
+   brew install --cask gcloud-cli
+   ```
 
-Then fill in what you need:
+   (or use the installer at <https://cloud.google.com/sdk/docs/install>)
 
-- `CASITA_GCP_PROJECT`: a GCP project with Vertex AI enabled
-- `CASITA_VOICE_MODEL`: model used for `--voice`'s transcription and replies, defaults to a fast one
-- `GOOGLE_MAPS_API_KEY`: optional, only needed for live route calculations
+2. Pick a GCP project (existing or new) and turn on the Vertex AI API for it:
 
-The rest of the variables are documented inline in `.env.example`.
+   ```bash
+   gcloud services enable aiplatform.googleapis.com --project=YOUR_PROJECT_ID
+   ```
 
-You'll also need to run `gcloud auth application-default login` once, so the Gemini client has something to authenticate with.
+3. Authenticate the client this app actually uses:
+
+   ```bash
+   gcloud auth application-default login
+   ```
+
+   If you get a warning about the quota project not matching, run:
+
+   ```bash
+   gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+   ```
+
+4. Copy the env file and set your project:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   - `CASITA_GCP_PROJECT`: your project ID (or number, both work)
+   - `CASITA_VOICE_MODEL`: model used for `--voice`'s transcription and replies, defaults to a fast one
+   - `GOOGLE_MAPS_API_KEY`: optional, only needed for live route calculations
+
+   The rest of the variables are documented inline in `.env.example`.
+
+That's it. `casita demo --intake`, `--voice`, and `/chat/` will all call live Gemini once `CASITA_GCP_PROJECT` is set and you're authenticated.
